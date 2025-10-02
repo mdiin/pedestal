@@ -17,7 +17,7 @@
             [io.pedestal.interceptor.chain :as chain]
             [io.pedestal.interceptor :as interceptor]
             [io.pedestal.connector :as conn]
-            [clojure.core.async :refer [go >! <! timeout close! chan put!]]
+            [clojure.core.async :refer [go go-loop >! <! <!! timeout close! chan put! thread]]
             [io.pedestal.http.sse :as sse :refer [start-event-stream]]
             [io.pedestal.test-common :refer [<!!?]]
             [clojure.test :refer [deftest is]]
@@ -102,43 +102,72 @@
                                  (close! ch))]
                 (sse/start-stream process-fn context)))}))
 
+(def indefinite-interceptor
+  (interceptor/interceptor
+   {:name ::indefinite
+    :enter (fn [context]
+             (let [the-chan (atom nil)
+                   process-fn (fn [ch _context]
+                                (reset! the-chan ch)
+                                (go-loop [t 1000]
+                                  ;; (println (str "timeout: " t))
+                                  (<! (timeout t))
+                                  (>! ch t)
+                                  (recur 0)))]
+               #_(sse/start-stream process-fn context)
+               (sse/start-stream process-fn context 1 10 {:on-client-disconnect (fn [_ctx]
+                                                                                  (println "disconnect")
+                                                                                  (>! @the-chan :disconnect!))})))}))
+
 (defn sse-session
-  [url]
-  (let [ch         (chan 5)
-        handler    (SSEHandler.)
-        httpClient (HttpClient/newHttpClient)
-        subscriber (reify Flow$Subscriber
+  ([url http-client]
+   (let [ch         (chan 5)
+         handler    (SSEHandler.)
+         httpClient http-client
+         response-subscription (atom nil)
+         subscriber (reify Flow$Subscriber
 
-                     (onSubscribe [_ subscription]
-                       (.request subscription Long/MAX_VALUE))
+                      (onSubscribe [_ subscription]
+                        (.request subscription 1)
+                        (reset! response-subscription subscription))
 
-                     ;; Normally, might want to check for comment events
-                     ;; But Pedestal doesn't even send those.
-                     (onNext [_ data-event]
-                       (put! ch [:message {:name (.getEventName ^DataEvent data-event)
-                                           :data (.getData ^DataEvent data-event)
-                                           :id   (.getLastEventId ^DataEvent data-event)}]))
+                      ;; Normally, might want to check for comment events
+                      ;; But Pedestal doesn't even send those.
+                      (onNext [_ data-event]
+                        (if (put! ch [:message {:name (.getEventName ^DataEvent data-event)
+                                            :data (.getData ^DataEvent data-event)
+                                                :id   (.getLastEventId ^DataEvent data-event)}])
+                          (.request @response-subscription 1)
+                          (.cancel @response-subscription)))
 
-                     (onError [_ error]
-                       (put! ch [:error error])
-                       (close! ch))
+                      (onError [_ error]
+                        (put! ch [:error error])
+                        (close! ch))
 
-                     (onComplete [_]
-                       (put! ch [:complete])
-                       (close! ch)))
-        request    (-> (HttpRequest/newBuilder)
-                       (.header "Accept" SSEHandler/EVENT_STREAM_MEDIA_TYPE)
-                       (.timeout (Duration/ofSeconds 100))
-                       (.uri (URI/create url))
-                       .build)
-        _          (.subscribe handler subscriber)
-        result     (.send httpClient request (HttpResponse$BodyHandlers/fromLineSubscriber handler))]
-    (is (= 200
-           (.statusCode ^HttpResponse result)))
+                      (onComplete [_]
+                        (put! ch [:complete])
+                        (close! ch)))
+         request    (-> (HttpRequest/newBuilder)
+                        (.header "Accept" SSEHandler/EVENT_STREAM_MEDIA_TYPE)
+                        (.timeout (Duration/ofSeconds 100))
+                        (.uri (URI/create url))
+                        .build)
+         _          (.subscribe handler subscriber)
+         result     (.sendAsync httpClient request (HttpResponse$BodyHandlers/fromLineSubscriber handler))]
+     #_(is (= 200
+            (.statusCode ^HttpResponse result)))
 
-    ;; Just a test, don't care that HttpClient is not properly closed.
-    ch))
-
+     ;; Just a test, don't care that HttpClient is not properly closed.
+     (future
+       (try
+         (.join result)
+         (close! ch)
+         (catch Throwable _t
+           (put! ch "error")
+           (close! ch))))
+     ch))
+  ([url]
+   (sse-session url (HttpClient/newHttpClient))))
 
 (defn- new-connector
   []
@@ -147,7 +176,8 @@
       conn/with-default-interceptors
       (conn/with-routes #{["/api/sse/:count/:id" :get count-interceptor]
                           ["/api/sse/ticker" :get ticker-interceptor]
-                          ["/api/sse/multi" :get multi-line-interceptor]})))
+                          ["/api/sse/multi" :get multi-line-interceptor]
+                          ["/api/sse/indefinite" :get indefinite-interceptor]})))
 
 (defn expect-messages
   [uri & messages]
@@ -206,11 +236,38 @@
       (finally
         (conn/stop! conn)))))
 
+(defn- disconnect
+  [id connector-fn]
+  (let [conn (-> (new-connector)
+                 (connector-fn nil)
+                 (conn/start!))
+        http-client (HttpClient/newHttpClient)]
+    (println (str "[" id "] h: " (.isTerminated http-client)))
+    (try
+      (let [ch (sse-session "http://localhost:9876/api/sse/indefinite" http-client)]
+        (println (<!!? ch))
+        (.shutdown http-client)
+        (<!! (go (timeout 1000)))
+        (println (<!!? ch))
+        (is (= [:disconnect] (<!! ch)))
+        ;; (println (<!!? ch))
+        ;; (println (<!!? ch))
+        )
+      (finally
+        (println (str "[" id "] h: " (.isTerminated http-client)))
+        (conn/stop! conn)))))
+
 (deftest jetty-end-to-end
   (end-to-end "jetty12" jetty/create-connector))
 
 (deftest hk-end-to-end
   (end-to-end "hk2.9.0" hk/create-connector))
+
+(deftest jetty-disconnect
+  (disconnect "jetty12" jetty/create-connector))
+
+(deftest hk-disconnect
+  (disconnect "hj2.9.0" hk/create-connector))
 
 (defonce *conn (atom nil))
 
@@ -231,4 +288,3 @@
   (start)
   (stop)
   )
-
