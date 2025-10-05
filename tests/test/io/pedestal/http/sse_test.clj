@@ -102,7 +102,8 @@
                                  (close! ch))]
                 (sse/start-stream process-fn context)))}))
 
-(def indefinite-interceptor
+(defn indefinite-interceptor
+  [disconnect-fn]
   (interceptor/interceptor
    {:name ::indefinite
     :enter (fn [context]
@@ -115,9 +116,7 @@
                                   (>! ch t)
                                   (recur 0)))]
                #_(sse/start-stream process-fn context)
-               (sse/start-stream process-fn context 1 10 {:on-client-disconnect (fn [_ctx]
-                                                                                  (println "disconnect")
-                                                                                  (>! @the-chan :disconnect!))})))}))
+               (sse/start-stream process-fn context 1 10 {:on-client-disconnect disconnect-fn})))}))
 
 (defn sse-session
   ([url http-client]
@@ -170,14 +169,16 @@
    (sse-session url (HttpClient/newHttpClient))))
 
 (defn- new-connector
-  []
+  ([disconnect-fn]
   (-> (conn/default-connector-map 9876)
       (conn/with-interceptor cors/dev-allow-origin)
       conn/with-default-interceptors
       (conn/with-routes #{["/api/sse/:count/:id" :get count-interceptor]
                           ["/api/sse/ticker" :get ticker-interceptor]
                           ["/api/sse/multi" :get multi-line-interceptor]
-                          ["/api/sse/indefinite" :get indefinite-interceptor]})))
+                          ["/api/sse/indefinite" :get (indefinite-interceptor disconnect-fn)]})))
+  ([]
+   (new-connector (constantly nil))))
 
 (defn expect-messages
   [uri & messages]
@@ -238,24 +239,31 @@
 
 (defn- disconnect
   [id connector-fn]
-  (let [conn (-> (new-connector)
-                 (connector-fn nil)
-                 (conn/start!))
-        http-client (HttpClient/newHttpClient)]
-    (println (str "[" id "] h: " (.isTerminated http-client)))
+  (let [d (promise)
+        disconnect-fn (fn [_]
+                        (println (str (Thread/currentThread) " -- Client disconnected - delivering promise"))
+                        (deliver d :disconnected))
+        conn (future
+               (println (str (Thread/currentThread) " -- connector starting"))
+               (-> (new-connector disconnect-fn)
+                   (connector-fn nil)
+                   (conn/start!)))
+        ]
     (try
-      (let [ch (sse-session "http://localhost:9876/api/sse/indefinite" http-client)]
-        (println (<!!? ch))
-        (.shutdown http-client)
-        (<!! (go (timeout 1000)))
-        (println (<!!? ch))
-        (is (= [:disconnect] (<!! ch)))
-        ;; (println (<!!? ch))
-        ;; (println (<!!? ch))
-        )
+      (println (str (Thread/currentThread) " -- test thread"))
+      @(future
+        (println (str (Thread/currentThread) " -- client thread"))
+        (let [http-client (HttpClient/newHttpClient)
+              ch (sse-session "http://localhost:9876/api/sse/indefinite" http-client)]
+          (println (<!!? ch))
+          (.shutdown http-client)
+          (<!! (go (timeout 1000)))
+          (println (<!!? ch))
+          ))
+      (is (= :disconnected (deref d 20000 ::timeout)))
       (finally
-        (println (str "[" id "] h: " (.isTerminated http-client)))
-        (conn/stop! conn)))))
+        (Thread/sleep 5000)
+        (conn/stop! @conn)))))
 
 (deftest jetty-end-to-end
   (end-to-end "jetty12" jetty/create-connector))
